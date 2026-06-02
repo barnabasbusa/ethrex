@@ -4,7 +4,7 @@ use ethrex_common::{
     types::{AccountState, BlockHash, BlockHeader, BlockNumber, ChainConfig, Code, CodeMetadata},
 };
 use ethrex_crypto::keccak::keccak_hash;
-use ethrex_storage::Store;
+use ethrex_storage::{StorageReadSession, Store};
 use ethrex_vm::{EvmError, VmDatabase};
 use rustc_hash::FxHashMap;
 use std::{
@@ -35,6 +35,9 @@ pub struct StoreVmDatabase {
     /// from the same account during execution.
     account_state_cache: Arc<RwLock<AccountStateCache>>,
     pub state_root: H256,
+    /// Snapshot of read resources at `state_root`, acquired once at construction
+    /// so per-opcode account/storage reads don't re-lock or re-open the backend.
+    read_session: StorageReadSession,
 }
 
 impl StoreVmDatabase {
@@ -52,12 +55,16 @@ impl StoreVmDatabase {
                 block_header.number, block_header.state_root
             )));
         }
+        let read_session = store
+            .begin_storage_read_session()
+            .map_err(|e| EvmError::DB(e.to_string()))?;
         Ok(StoreVmDatabase {
             store,
             block_hash: block_header.hash(),
             block_hash_cache: Arc::new(Mutex::new(BTreeMap::new())),
             account_state_cache: Arc::new(RwLock::new(FxHashMap::default())),
             state_root: block_header.state_root,
+            read_session,
         })
     }
 
@@ -76,12 +83,16 @@ impl StoreVmDatabase {
                 block_header.number, block_header.state_root
             )));
         }
+        let read_session = store
+            .begin_storage_read_session()
+            .map_err(|e| EvmError::DB(e.to_string()))?;
         Ok(StoreVmDatabase {
             store,
             block_hash: block_header.hash(),
             block_hash_cache: Arc::new(Mutex::new(block_hash_cache)),
             account_state_cache: Arc::new(RwLock::new(FxHashMap::default())),
             state_root: block_header.state_root,
+            read_session,
         })
     }
 
@@ -101,7 +112,7 @@ impl StoreVmDatabase {
 
         let loaded = self
             .store
-            .get_account_state_by_root(self.state_root, address)
+            .get_account_state_with_session(&self.read_session, self.state_root, address)
             .map_err(|e| EvmError::DB(e.to_string()))?;
         let cached = loaded.map(|state| AccountStateCacheEntry {
             state,
@@ -205,7 +216,8 @@ impl VmDatabase for StoreVmDatabase {
             return Ok(None);
         };
         self.store
-            .get_storage_at_root_with_known_storage_root(
+            .get_storage_with_session(
+                &self.read_session,
                 self.state_root,
                 entry.hashed_address,
                 entry.state.storage_root,
